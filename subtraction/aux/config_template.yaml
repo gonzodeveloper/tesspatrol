@@ -1,0 +1,16 @@
+# Directory info
+data_dir: "/PATH/TO/data/"
+log_dir: "/PATH/TO/log/"
+script_dir: "/PATH/TO/tesspatrol/subtraction/scripts/"
+
+# Directory containing ref_lists (files for building reference images)
+ref_list_dir: "/PATH/TO/ref_lists/"
+
+# Default config file for ISIS
+isis_config: "/PATH/TO/DEFAULT/CONFIG/default_config"
+
+# Postgres
+db_user: "USERNAME"
+db_pass: "PASSWORD"
+db_host: "/var/run/postgresql (PROBABLY)"
+db_name: "DBNAME"

@@ -1,0 +1,22 @@
+# Server
+host_address: "HOSTNAME"
+host_port: 0000
+
+# Directory info
+log_file: "/PATH/TO/LOGS/"
+request_data_dir: "/PATH/TO/SAVE/LIGHTCURVES"
+
+# Postgres
+db_user: "USERNAME"
+db_pass: "PASSWORD"
+db_host: "/var/run/postgresql (PROBABLY)"
+db_name: "DBNAME"
+
+# Kafka
+kafka_host: "hostname"
+
+# Photometry (SHOULD KEEP)
+phot_aptr: 2.0
+phot_skyin: 8.0
+phot_skyout: 10.0
+calibration_order: 3

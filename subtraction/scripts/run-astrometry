@@ -1,0 +1,53 @@
+#!/usr/local/share/conda_envs/tesspatrol_conda/bin/python
+
+import argparse
+import subprocess
+import shutil
+import re
+import os
+
+# Parse arguments
+parser = argparse.ArgumentParser("run-astrometry", description="Wrapper for astropy.net astrometry script")
+parser.add_argument("ra", type=float, help="ra for center of field")
+parser.add_argument("dec", type=float, help="dec for center of field")
+parser.add_argument("cam_ccd_dir", type=str, help="cam/ccd field directory containing ref filer")
+args = parser.parse_args()
+
+# Astrometry.net path and parameters
+ASTROMETRY_NET = "/usr/local/astrometry/bin/solve-field"
+RADIUS = 6
+LOW = 5
+HIGH = 8
+
+# Move to dir
+os.chdir(args.cam_ccd_dir)
+
+# Run command
+command_base = f"{ASTROMETRY_NET}    " \
+               f"--no-plots                      " \
+               f"--index-xyls none               " \
+               f"--axy none                      " \
+               f"--solved none                   " \
+               f"--corr none                     " \
+               f"--match none                    " \
+               f"--rdls none                     " \
+               f"--use-source-extractor          " \
+               f"--overwrite                     " \
+               f"--radius {RADIUS}               " \
+               f"--scale-units degwidth          " \
+               f"--ra {args.ra} --dec {args.dec} " \
+               f"ref.fits "
+
+
+# Reduce str
+cmd_str = re.sub(' +', ' ', command_base)
+# Run command
+result = subprocess.run(cmd_str, stdout=subprocess.PIPE, shell=True)
+output = result.stdout.decode('utf-8')
+print(output)
+
+# Parse output for ra and dec
+field_ctr_line = re.findall(r"^Field center: \(RA,Dec\).*", output, flags=re.MULTILINE)[0]
+ra, dec = [float(x) for x in re.findall(r"[+-]? *(?:\d+(?:\.\d*)?|\.\d+)", field_ctr_line)]
+# Remove none file
+os.remove("none")

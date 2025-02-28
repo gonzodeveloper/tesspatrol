@@ -1,0 +1,248 @@
+#!/usr/local/share/conda_envs/tesspatrol_conda/bin/python
+from photutils.aperture import CircularAperture, CircularAnnulus, ApertureStats
+from astropy.coordinates import SkyCoord
+from astropy.io import fits
+from astropy.wcs import WCS
+from scipy.spatial import distance
+from scipy.stats import norm
+import astropy.units as u
+import pandas as pd
+import numpy as np
+import subprocess
+import logging
+import itertools
+import argparse
+import warnings
+import sys
+import os
+
+pd.set_option('mode.chained_assignment', None)
+pd.set_option('display.width', 0)
+
+LOG_DIR = "/data/projects/TESS/log/"
+
+
+def apphot(df, data, app, skyin, skyout, exptime, correction=0):
+    # Photutils tools
+    xy = list(zip(df['x'].to_list(), df['y'].to_list()))
+    src_app = CircularAperture(xy, app)
+    bkg_ann = CircularAnnulus(xy, skyin, skyout)
+    src_phot = ApertureStats(data, src_app)
+    bkg_phot = ApertureStats(data, bkg_ann)
+    cts = src_phot.sum - (src_app.area * bkg_phot.mean)
+    cts_per_s = cts / exptime
+    # Calculate flux error
+    e_cts_per_s = np.sqrt(cts_per_s + (src_app.area * bkg_phot.var) / exptime)
+    # Calculate mag and mag error
+    df["mag"] = -2.5 * np.log10(np.abs(cts_per_s)) + 20.44 + correction
+    df['e_mag'] = e_cts_per_s / cts_per_s / 0.92
+    # Phot line
+    return df
+
+
+def polyval2d(x, y, m, order):
+    ij = itertools.product(range(order + 1), range(order + 1))
+    z = np.zeros_like(x)
+    for a, (i, j) in zip(m, ij):
+        z += a * x ** i * y ** j
+    return z
+
+
+def get_cal_params(header, app, skyin, skyout, order):
+    return np.array([header[f"A{app}O{order}i{skyin}o{skyout}X{i}Y{j}"]
+                     for i, j in itertools.product(range(order + 1), range(order + 1))])
+
+
+# Parse args
+parser = argparse.ArgumentParser("calibrate-field", description="TESS Patrol Field Calibrations")
+parser.add_argument("--ref_cal_file", type=str, help="csv containing refcat tars for field")
+parser.add_argument("-a", "--aperture", type=float, default=2.0, help="aperture for calibration")
+parser.add_argument("-i", "--skyin", type=float, default=8.0, help="inner radius for background annulus")
+parser.add_argument("-o", "--skyout", type=float, default=10.0, help="out radius for background annulus")
+parser.add_argument("-d", "--dsig", type=float, default=5.0, help="sigma cut for non-detections")
+parser.add_argument("-O", "--order", type=int, default=3, help="order polynomial for correction")
+parser.add_argument("--exptime", type=float, help="if set use this exposure time, if not, read header")
+parser.add_argument("cam_ccd_dir", type=str, help="cam/ccd field directory containing ref filer")
+parser.add_argument("sector_id", type=str, help="TESS sector ID")
+
+args = parser.parse_args()
+
+
+# Logger
+# Set logger
+logger = logging.getLogger("calibrations")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+log_file = LOG_DIR + f"ingest_sector_{int(args.sector_id):04d}.log"
+handler = logging.FileHandler(log_file)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# Enter working dir
+cam_ccd_dir_path = os.path.abspath(args.cam_ccd_dir)
+os.chdir(cam_ccd_dir_path)
+
+# Reading img
+logger.debug(f"opening ref file at {os.path.join(cam_ccd_dir_path, 'ref.fits')}")
+with fits.open("ref.fits") as hdul:
+    hdr = hdul[0].header
+    data = hdul[0].data
+wcs_hdr = fits.open("ref.wcs")[0].header
+
+# Get ra/dec
+ra, dec = wcs_hdr['CRVAL1'], wcs_hdr['CRVAL2']
+
+if args.ref_cal_file is None:
+    # Reach rectangle around the center
+    logger.debug("running refcat script for targets")
+    cmd = f"/data/projects/refcat/refcat {ra} {dec} " \
+          f"-dir /data/projects/refcat/16_m_17/,/data/projects/refcat/17_m_18/,/data/projects/refcat/18_m_19/ " \
+          f"-rect 6.0,6.0 -hdr -all"
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, shell=True)
+    output = result.stdout.decode('utf-8')
+
+    # Separate (dump last line)
+    out_lines = [l.split() for l in output.split("\n")[:-1]]
+    # Build dataframe (first line has column names)
+    ref_df = pd.DataFrame(out_lines[1:], columns=out_lines[0][1:])
+    ref_df = ref_df.apply(pd.to_numeric, args=('coerce', ))
+    # Save for posterity
+    ref_df.to_csv('ref_cal.csv', index=False, sep=",")
+else:
+    ref_df = pd.read_csv(args.ref_cal_file)
+
+logger.debug(f"using {len(ref_df):,} refcat targets")
+
+# Map to coords
+coords = ref_df.apply(lambda tar: SkyCoord(tar['RA'] * u.deg, tar['Dec'] * u.deg, frame='fk5'), axis=1)
+
+# Get WCS for x/y positions
+with warnings.catch_warnings():
+      warnings.simplefilter("ignore")
+      wcs = WCS(wcs_hdr, relax=True)
+
+x, y = list(zip(*[wcs.world_to_pixel(c) for c in coords]))
+
+# Add to dataframe
+ref_df['x'] = [float(i) for i in x]
+ref_df['y'] = [float(i) for i in y]
+
+# First cut refcat df on pixel border
+border = 128
+naxis1 = hdr['NAXIS1']
+naxis2 = hdr['NAXIS2']
+ref_df = ref_df[(border < ref_df.x) & (ref_df.x < naxis1 - border)
+            & (border < ref_df.y) & (ref_df.y < naxis2 - border)]
+# Cut on rp
+ref_df = ref_df[ref_df['rp1'] >= 25]
+
+# Get average mags
+ref_df['ref_mag'] = ref_df[['r', 'i', 'z']].mean(axis=1)
+
+# Cut on mags
+ref_df = ref_df[(ref_df['ref_mag'] < 18) & (ref_df['ref_mag'] > 12)]
+
+# Log and save
+logger.debug(f"using {len(ref_df):,} refcat targets after cuts")
+ref_df.to_csv("calibs.csv", index=False)
+
+# Exptime for phot
+exptime = args.exptime if args.exptime is not None else hdr['EXPTIME']
+
+# Run photometry on ref targets in image
+phot_df = apphot(ref_df, data,
+                 app=args.aperture,
+                 skyin=args.skyin,
+                 skyout=args.skyout,
+                 exptime=exptime)
+
+# Throw out non_detections
+non_detections = (args.dsig * phot_df['e_mag'] > phot_df['mag']) | (phot_df['e_mag'] < 0)
+phot_df = phot_df.loc[~non_detections]
+
+logger.debug(f"using photometry from {len(phot_df):,} targets")
+
+# Get center distances and mag diffs
+crpix1, crpix2 = wcs_hdr['CRPIX1'], wcs_hdr['CRPIX2']
+phot_df['center_dist'] = phot_df.apply(lambda row: distance.euclidean((crpix1, crpix2), (row.x, row.y)), axis=1)
+
+# Fractional positions
+phot_df["xpos"] = phot_df['x'] / hdr['NAXIS1']
+phot_df['ypos'] = phot_df['y'] / hdr['NAXIS2']
+
+# Iteratively remove outliers
+n = 0
+while (n != len(phot_df)) and (len(phot_df) != 0):
+    n = len(phot_df)
+    mag_diff = np.abs(phot_df['ref_mag'] - phot_df['mag'])
+
+    # Fit polynomial
+    G = np.zeros((n, (args.order + 1) ** 2))
+    ij = itertools.product(range(args.order + 1), range(args.order + 1))
+    for k, (i, j) in enumerate(ij):
+        G[:, k] = phot_df["xpos"] ** i * phot_df["ypos"] ** j
+    m, _, _, _ = np.linalg.lstsq(G, mag_diff, rcond=-1)
+
+    # Apply polynomial
+    ij = itertools.product(range(args.order + 1), range(args.order + 1))
+    z = np.zeros_like(phot_df["xpos"])
+    for a, (i, j) in zip(m, ij):
+        z += a * phot_df["xpos"]**i * phot_df["ypos"]**j
+
+    resid = mag_diff - polyval2d(phot_df['xpos'], phot_df['ypos'], m, order=args.order)
+
+    # Calculate the sigma limit were we would falsely throw out one data point
+    mag_stdev = np.std(resid)
+    if mag_stdev > 0.15:
+        mag_stdev = mag_stdev
+    sigma_cut = norm.ppf(1.0 - (1.0 / n / 2.0))
+
+    # Throw out outliers
+    phot_df["abs_resid"] = np.abs(resid)
+    phot_df = phot_df[phot_df["abs_resid"] < mag_stdev * sigma_cut]
+
+logger.debug(f"used {len(phot_df):,} for recalibration")
+
+# Save dataframe
+phot_df.to_csv("ref_phot.csv", index=False, sep=",")
+
+with fits.open("ref.wcs", mode='update') as hdul:
+    hdr = hdul[0].header
+    # hdr.update(wcs_hdr)
+    ij = itertools.product(range(args.order + 1), range(args.order + 1))
+    for a, (i, j) in zip(m, ij):
+        hdr.append((f"hierarch A{args.aperture}O{args.order}i{args.skyin}o{args.skyout}X{i}Y{j}", a,
+                    "Photmetric Calibration Parameters"))
+    hdr.append((f"hierarch A{args.aperture}O{args.order}i{args.skyin}o{args.skyout}std", mag_stdev,
+                'Stdev about Photmetric Calibration'))
+    hdr.append((f"hierarch A{args.aperture}O{args.order}i{args.skyin}o{args.skyout}num", n,
+                'Number of stars used for Photmetric Calibration'), end=True)
+    hdul.flush()
+
+logger.info({"field": cam_ccd_dir_path,
+             "refcat_tars": len(ref_df),
+             "calibration_tars": len(phot_df)})
+
+"""
+
+# Now get poly_correction
+params = get_cal_params(hdr, args.app, args.skyin, args.skyout, args.order)
+poly = polyval2d(phot_df['xpos'], phot_df['ypos'], params, order=args.order)
+new_phot_df = apphot(phot_df, hdu.data,
+                     app=args.aperture,
+                     skyin=args.skyin,
+                     skyout=args.skyout,
+                     exptime=hdu.header['EXPTIME'],
+                     correction=poly)
+
+print("CORRECTED PHOT")
+print(new_phot_df)
+new_phot_df("phot.csv", index=False)
+"""
+
+

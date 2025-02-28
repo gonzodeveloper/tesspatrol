@@ -1,0 +1,83 @@
+#!/usr/local/share/conda_envs/tesspatrol_conda/bin/python
+
+from scipy.ndimage import gaussian_filter
+from astropy.io import fits
+from astropy.wcs import FITSFixedWarning
+import numpy as np
+import reproject
+import warnings
+import argparse
+import logging
+import sys
+import os
+
+# ENV Settings
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+LOG_DIR = "/data/projects/TESS/log/"
+
+# Parse arguments
+parser = argparse.ArgumentParser("quick-smooth")
+parser.add_argument("-w", "--wcs_align", action="store_true", help="if set, then we will align the interps via wcs")
+parser.add_argument("cam_ccd_dir", type=str, help="directory containing the raw images for the cam/ccd field")
+parser.add_argument("sector_id", type=str, help="TESS sector ID")
+args = parser.parse_args()
+
+# Set logger
+logger = logging.getLogger("quick-smooth")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+log_file = LOG_DIR + f"ingest_sector_{int(args.sector_id):04d}.log"
+handler = logging.FileHandler(log_file)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# Warning on MJD -> DATE write
+warnings.simplefilter("ignore", category=FITSFixedWarning)
+
+# Change to cam-ccd image dir
+os.chdir(args.cam_ccd_dir)
+img_list = np.genfromtxt('dates',usecols=(0),dtype=str)
+
+# Use image in center of series as a reference for alignment
+sample_ref = img_list[int(len(img_list) / 2)]
+ref_wcs = reproject.wcs_utils.WCS(fits.open(sample_ref)[0].header)
+
+# Interpolate and smooth all images
+for img in img_list:
+    # Read in image
+    hdu0 = fits.open(img)
+
+    if args.wcs_align:
+        try:
+            reprojected_image, _ = reproject.reproject_interp(hdu0[0], ref_wcs)
+            # Smooth image
+            data = gaussian_filter(reprojected_image,0.9,mode='constant')
+            # Save out to interp_ file
+            hdu1 = fits.PrimaryHDU(data=data, header=hdu0[0].header)
+            # Update WCS information for reprojection
+            hdu1.header.update(ref_wcs.to_header(relax=True))
+        except:
+            # Smooth image
+            data = gaussian_filter(hdu0[0].data, 0.9, mode='constant')
+            # Save out to interp_ file
+            hdu1 = fits.PrimaryHDU(data=data, header=hdu0[0].header)
+            logger.warning(f"re-align failed for {img}")
+
+    else:
+        # Smooth image
+        data = gaussian_filter(hdu0[0].data, 0.9, mode='constant')
+        # Save out to interp_ file
+        hdu1 = fits.PrimaryHDU(data=data, header=hdu0[0].header)
+
+    # Get fits table from original
+    hdu0 = hdu0[1]
+    # Smooth interp as first hdu (save raw as second)
+    hdu_list = fits.HDUList([hdu1,hdu0])
+    hdu_list.writeto('interp_'+ img, checksum=True)
+
+
